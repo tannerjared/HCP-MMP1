@@ -186,8 +186,13 @@ for subject in `cat ${subject_list}`
 		rm -f ${output_dir}/temp_${first}_${last}_${rand_id}/temp_cat_${annotation_file}_R
 		rm -f ${output_dir}/temp_${first}_${last}_${rand_id}/temp_cat_${annotation_file}_L
 		for labelsR in `cat ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}R`
-			do printf " --l ${output_dir}/${subject}/label/${labelsR}" >> ${output_dir}/temp_${first}_${last}_${rand_id}/temp_cat_${annotation_file}_R
-		done
+			do if [ -e ${output_dir}/${subject}/label/${labelsR} ]
+			then printf " --l ${output_dir}/${subject}/label/${labelsR}" >> ${output_dir}/temp_${first}${last}${rand_id}/temp_cat_${annotation_file}_R
+			fi
+			done
+		#for labelsR in `cat ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}R`
+		#	do printf " --l ${output_dir}/${subject}/label/${labelsR}" >> ${output_dir}/temp_${first}_${last}_${rand_id}/temp_cat_${annotation_file}_R
+		#done
 		for labelsL in `cat ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}L`
 			do if [ -e ${output_dir}/${subject}/label/${labelsL} ]
 				then printf " --l ${output_dir}/${subject}/label/${labelsL}" >> ${output_dir}/temp_${first}_${last}_${rand_id}/temp_cat_${annotation_file}_L
