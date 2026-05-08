@@ -14,7 +14,7 @@ as the default path, but the implementation is cleaned up and easier to inspect.
 
 - `create_subj_volume_parcellation.sh` is the main maintained script.
 - `create_subj_volume_parcellation_optimized.sh` is an experimental
-  entry point because the newer optimized approach has not been fully validated.
+  entry point because the newer optimized approach has not been fully validated. I've done limited testing and it produced the same results as the other method, but do your own verification.
 - The default script still maps labels with `mri_label2label` and rebuilds
   annotations with `mris_label2annot`, matching the established CJ Neurolab
   workflow more closely.
