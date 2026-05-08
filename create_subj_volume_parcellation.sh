@@ -454,32 +454,55 @@ create_cortical_masks() {
     done
 }
 
+lut_index_for_name() {
+    local structure_name="$1"
+    local index
+
+    index="$(awk -v name="${structure_name}" '$2 == name { print $1; exit }' "${COLOR_LUT}")"
+    [[ -n "${index}" ]] || return 1
+
+    printf '%s\n' "${index}"
+}
+
+create_aseg_mask() {
+    local final_volume="$1"
+    local aseg_mask_dir="$2"
+    local structure_name="$3"
+    local fs_index
+
+    if ! fs_index="$(lut_index_for_name "${structure_name}")"; then
+        warn "Could not find '${structure_name}' in ${COLOR_LUT}; skipping."
+        return
+    fi
+
+    fslmaths "${final_volume}" \
+        -thr "${fs_index}" \
+        -uthr "${fs_index}" \
+        -bin "${aseg_mask_dir}/${structure_name}.nii.gz"
+}
+
 create_aseg_masks() {
     local subject_output_dir="$1"
     local final_volume="${subject_output_dir}/${ANNOT_NAME}.nii.gz"
     local aseg_mask_dir="${subject_output_dir}/aseg_masks"
     local side
     local structure
-    local full_name
-    local fs_index
+    local thalamus_name
 
     info "Creating subcortical aseg masks."
     mkdir -p "${aseg_mask_dir}"
 
     for side in Left Right; do
-        for structure in Thalamus-Proper Caudate Pallidum Hippocampus Amygdala Accumbens-area; do
-            full_name="${side}-${structure}"
-            fs_index="$(awk -v name="${full_name}" '$2 == name { print $1; exit }' "${COLOR_LUT}")"
+        if lut_index_for_name "${side}-Thalamus-Proper" >/dev/null; then
+            thalamus_name="${side}-Thalamus-Proper"
+        else
+            thalamus_name="${side}-Thalamus"
+        fi
 
-            if [[ -z "${fs_index}" ]]; then
-                warn "Could not find '${full_name}' in ${COLOR_LUT}; skipping."
-                continue
-            fi
+        create_aseg_mask "${final_volume}" "${aseg_mask_dir}" "${thalamus_name}"
 
-            fslmaths "${final_volume}" \
-                -thr "${fs_index}" \
-                -uthr "${fs_index}" \
-                -bin "${aseg_mask_dir}/${full_name}.nii.gz"
+        for structure in Caudate Pallidum Hippocampus Amygdala Accumbens-area; do
+            create_aseg_mask "${final_volume}" "${aseg_mask_dir}" "${side}-${structure}"
         done
     done
 }

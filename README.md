@@ -45,6 +45,9 @@ the root of `$SUBJECTS_DIR`, the script will copy them into `fsaverage/label/`.
 
 For subcortical aseg masks (`-s YES`), the script looks for
 `FreeSurferColorLUT.txt` in `$SUBJECTS_DIR` first, then in `$FREESURFER_HOME`.
+For thalamus masks, it prefers the older `Left-Thalamus-Proper` and
+`Right-Thalamus-Proper` names when present, then falls back to the newer
+`Left-Thalamus` and `Right-Thalamus` names.
 
 ## Main vs. Optimized Script
 
