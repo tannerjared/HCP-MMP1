@@ -1,316 +1,680 @@
 #!/usr/bin/env bash
 
-# Creates subject-level parcellation image from annotation files in fsaverage space. Can be used with the HCP-MMP1.0 projected on fsaverage annotation files available from https://figshare.com/articles/HCP-MMP1_0_projected_on_fsaverage/3498446
-# usage:
-# bash create_subj_volume_parcellation -L <subject_list> -a <name_of_annot_file> -f <first_subject_row> -l <last_subject_row> -d <name_of_output_dir>
-# 
-# 
-# HOW TO USE
-# 
-# Ingredients:
-# 
-# Subject data. First of all, you need to have your subjects’ structural data preprocessed with FreeSurfer.
-# Shell script. Download the script: create_subj_volume_parcellation, unzip it (because wordpress won’t upload .sh files directly), and copy it to to your $SUBJECTS_DIR/ folder.
-# Fsaverage data. Copy the fsaverage folder from the FreeSurfer directory ($FREESURFER_HOME/subjects/fsaverage) to your $SUBJECTS_DIR/ folder.
-# Annotation files. Download rh.HCPMMP1.annot and lh.HCPMMP1.annot from https://figshare.com/articles/HCP-MMP1_0_projected_on_fsaverage/3498446. Copy them to your $SUBJECTS_DIR/ folder or to $SUBJECTS_DIR/fsaverage/label/.
-# Subject list. Create a list with the identifiers of the desired target subjects (named exactly as their corresponding names in $SUBJECTS_DIR/, of course).
-#  
-# Instructions:
-# 
-# Launch the script: bash create_subj_volume_parcellation.sh (this will show the compulsory and optional arguments).
-# The compulsory arguments are:
-# -L subject_list_name
-# -a name_of_annotation_file (without hemisphere or extension; in this case, HCPMMP1)
-# -d name_of_output_dir (will be created in $SUBJECTS_DIR)
-# Optional arguments:
-# -f and -l indicate the first and last subjects in the subject list to be processed. Eg, in order to process the third till the fifth subject, one would enter -f 3 -l 5 (whole thing takes a bit of time, so one might want to launch it in separate terminals for speed)
-# -m (YES or NO, default NO) indicates whether individual volume files for each parcellation region should be created. This requires FSL
-# -s (“YES” or “NO”, default is NO) indicates whether individual volume files for each subcortical aseg region should be created. Also requires FSL, and requires that the FreeSurferColorLUT.txt file be present at the base (subjects) folder
-# -t (YES or NO, default YES) indicates whether to create anatomical stats table (number of vertices, area, volume, mean thickness, etc.) per region
-# Output:
-# An output folder named as specified with the -d option will be created, which will contain a directory called label/, where the labels for the regions projected on fsaverage will be stored. The output directory will also contain a folder for each subject. Inside these subject folders, a .nii.gz file named as # the annotation file (-a option) will contain the final parcellation volume. A look-up table will also be created inside each subject’s folder, named LUT_<name_of_annotation_file>.txt. In each subject’s folder, a directory called label/ will also be created, where the transformed labels will be stored
-# If the -m option is set to YES, each subject’s directory will also contain a masks/ directory containing one volume .nii.gz file for each binary mask
-# If the -s option is set to YES, an aseg_masks/ directory will be created, containing one .nii.gz file for each subcortical region
-# Inside the original subjects’ label folders, post-transformation annotation files will be created. These are not overwritten if the script is relaunched; so, if you ran into a problem and want to start over, you should delete these files (named lh(rh).<subject>_<name_of_annotation_file>.annot)
+# Create a subject-space HCP-MMP1 parcellation volume from fsaverage annotation
+# files. The script expects FreeSurfer subjects that have already completed
+# recon-all, plus the HCP-MMP1 annotation files in fsaverage space.
 
-# define compulsory and optional arguments
-while getopts ":L:f:l:a:d::m:t:s:" o; do
-    case "${o}" in
-        L)
-            L=${OPTARG}
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+SCRIPT_NAME="$(basename "$0")"
+
+usage() {
+    cat <<EOF
+
+Usage:
+  ${SCRIPT_NAME} -L <subject_list> -a <annotation_name> -d <output_dir> [options]
+
+Required arguments:
+  -L <file>     Text file containing FreeSurfer subject IDs.
+  -a <name>     Annotation basename without hemisphere or extension.
+                Example: HCPMMP1 for lh.HCPMMP1.annot and rh.HCPMMP1.annot.
+  -d <dir>      Output directory. Relative paths are created inside SUBJECTS_DIR.
+
+Optional arguments:
+  -f <int>      First row in the subject list to process. Default: 1.
+  -l <int>      Last row in the subject list to process. Default: end of file.
+  -m <YES|NO>   Create one cortical mask per region. Default: NO.
+  -s <YES|NO>   Create subcortical aseg masks. Default: NO.
+  -t <YES|NO>   Create anatomical stats tables. Default: YES.
+  -h            Show this help text.
+
+Examples:
+  ${SCRIPT_NAME} -L subject_list.txt -a HCPMMP1 -d HCPMMP_parcellation
+  ${SCRIPT_NAME} -L subject_list.txt -f 1 -l 5 -a HCPMMP1 -d HCPMMP_parcellation -m YES -s YES
+
+EOF
+}
+
+log() {
+    printf '\n>>>> %s\n' "$*"
+}
+
+info() {
+    printf '  %s\n' "$*"
+}
+
+warn() {
+    printf 'WARNING: %s\n' "$*" >&2
+}
+
+fail() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [[ -n "${TEMP_DIR:-}" && -d "${TEMP_DIR}" ]]; then
+        rm -rf "${TEMP_DIR}"
+    fi
+}
+
+is_positive_integer() {
+    [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 > 0))
+}
+
+normalize_yes_no() {
+    local flag_name="$1"
+    local value="$2"
+
+    value="$(printf '%s' "${value}" | tr '[:lower:]' '[:upper:]')"
+    case "${value}" in
+        YES | NO)
+            printf '%s\n' "${value}"
             ;;
-        f)
-            f=${OPTARG}
+        *)
+            fail "${flag_name} must be YES or NO, got '${value}'."
             ;;
-        l)
-            l=${OPTARG}
+    esac
+}
+
+require_command() {
+    local command_name="$1"
+
+    if ! command -v "${command_name}" >/dev/null 2>&1; then
+        fail "Required command '${command_name}' was not found in PATH."
+    fi
+}
+
+resolve_subject_list() {
+    local requested_path="$1"
+
+    if [[ -f "${requested_path}" ]]; then
+        printf '%s\n' "${requested_path}"
+        return
+    fi
+
+    if [[ -n "${SUBJECTS_DIR:-}" && -f "${SUBJECTS_DIR}/${requested_path}" ]]; then
+        printf '%s\n' "${SUBJECTS_DIR}/${requested_path}"
+        return
+    fi
+
+    fail "Subject list not found: ${requested_path}"
+}
+
+resolve_output_dir() {
+    local requested_path="$1"
+
+    if [[ "${requested_path}" = /* ]]; then
+        printf '%s\n' "${requested_path}"
+    else
+        printf '%s\n' "${SUBJECTS_DIR}/${requested_path}"
+    fi
+}
+
+find_color_lut() {
+    if [[ -f "${SUBJECTS_DIR}/FreeSurferColorLUT.txt" ]]; then
+        printf '%s\n' "${SUBJECTS_DIR}/FreeSurferColorLUT.txt"
+        return
+    fi
+
+    if [[ -n "${FREESURFER_HOME:-}" && -f "${FREESURFER_HOME}/FreeSurferColorLUT.txt" ]]; then
+        printf '%s\n' "${FREESURFER_HOME}/FreeSurferColorLUT.txt"
+        return
+    fi
+
+    return 1
+}
+
+ensure_annotation_files() {
+    local fsaverage_label_dir="${SUBJECTS_DIR}/fsaverage/label"
+    local hemi
+    local target
+    local fallback
+
+    [[ -d "${fsaverage_label_dir}" ]] || fail "Expected fsaverage labels at ${fsaverage_label_dir}."
+    [[ -f "${SUBJECTS_DIR}/fsaverage/surf/lh.white" ]] || fail "fsaverage is missing surf/lh.white."
+    [[ -f "${SUBJECTS_DIR}/fsaverage/surf/rh.white" ]] || fail "fsaverage is missing surf/rh.white."
+    [[ -f "${SUBJECTS_DIR}/fsaverage/surf/lh.sphere.reg" ]] || fail "fsaverage is missing surf/lh.sphere.reg."
+    [[ -f "${SUBJECTS_DIR}/fsaverage/surf/rh.sphere.reg" ]] || fail "fsaverage is missing surf/rh.sphere.reg."
+
+    for hemi in lh rh; do
+        target="${fsaverage_label_dir}/${hemi}.${ANNOT_NAME}.annot"
+        fallback="${SUBJECTS_DIR}/${hemi}.${ANNOT_NAME}.annot"
+
+        if [[ -f "${target}" ]]; then
+            continue
+        fi
+
+        if [[ -f "${fallback}" ]]; then
+            info "Copying ${hemi}.${ANNOT_NAME}.annot into fsaverage/label."
+            cp "${fallback}" "${fsaverage_label_dir}/"
+        else
+            fail "Missing ${hemi}.${ANNOT_NAME}.annot in ${fsaverage_label_dir} or ${SUBJECTS_DIR}."
+        fi
+    done
+}
+
+build_region_metadata() {
+    local atlas_label_dir="${OUTPUT_DIR}/label"
+    local hemi
+    local base
+    local ctab_file
+    local clean_ctab_file
+    local log_file
+
+    log "Reading annotation metadata from fsaverage"
+    mkdir -p "${atlas_label_dir}" "${OUTPUT_DIR}/logs"
+
+    : >"${MASTER_LUT}"
+    : >"${REGION_TABLE}"
+    printf 'index\tlabel_file\tregion_name\n' >"${MASTER_LUT}"
+    printf 'index\themi\tregion_name\tlabel_file\n' >"${REGION_TABLE}"
+
+    for hemi in lh rh; do
+        if [[ "${hemi}" == "lh" ]]; then
+            base=1000
+        else
+            base=2000
+        fi
+
+        ctab_file="${TEMP_DIR}/${hemi}.${ANNOT_NAME}.raw.ctab"
+        clean_ctab_file="$(ctab_for_hemi "${hemi}")"
+        log_file="${OUTPUT_DIR}/logs/mri_annotation2label_${hemi}.log"
+
+        : >"${clean_ctab_file}"
+
+        mri_annotation2label \
+            --subject fsaverage \
+            --hemi "${hemi}" \
+            --annotation "${ANNOT_NAME}" \
+            --outdir "${atlas_label_dir}" \
+            --ctab "${ctab_file}" \
+            >"${log_file}" 2>&1
+
+        awk \
+            -v base="${base}" \
+            -v hemi="${hemi}" \
+            -v label_dir="${atlas_label_dir}" \
+            -v clean_ctab="${clean_ctab_file}" \
+            -v master_lut="${MASTER_LUT}" \
+            -v region_table="${REGION_TABLE}" '
+            NF >= 6 && $1 ~ /^[0-9]+$/ {
+                region_name = $2
+
+                if ($1 == 0 || tolower(region_name) == "unknown" || region_name == "???") {
+                    next
+                }
+
+                label_file = hemi "." region_name ".label"
+                label_path = label_dir "/" label_file
+
+                if ((getline first_line < label_path) >= 0) {
+                    close(label_path)
+                    local_index++
+                    final_index = base + local_index
+                    printf "%d\t%s\t%s\t%s\t%s\t%s\n", local_index, region_name, $3, $4, $5, $6 >> clean_ctab
+                    printf "%d\t%s\t%s\n", final_index, label_file, region_name >> master_lut
+                    printf "%d\t%s\t%s\t%s\n", final_index, hemi, region_name, label_file >> region_table
+                }
+            }
+        ' "${ctab_file}"
+    done
+}
+
+ctab_for_hemi() {
+    local hemi="$1"
+
+    printf '%s/%s.%s.label2annot.ctab\n' "${TEMP_DIR}" "${hemi}" "${ANNOT_NAME}"
+}
+
+subject_annotation_path() {
+    local subject="$1"
+    local hemi="$2"
+
+    printf '%s/%s/label/%s.%s_%s.annot\n' \
+        "${SUBJECTS_DIR}" "${subject}" "${hemi}" "${subject}" "${ANNOT_NAME}"
+}
+
+map_annotations_direct_to_subject() {
+    local subject="$1"
+    local subject_output_dir="$2"
+    local hemi
+    local source_annot
+    local subject_annot
+    local output_copy
+    local log_file
+
+    mkdir -p "${subject_output_dir}/label" "${subject_output_dir}/logs"
+
+    for hemi in lh rh; do
+        source_annot="${SUBJECTS_DIR}/fsaverage/label/${hemi}.${ANNOT_NAME}.annot"
+        subject_annot="$(subject_annotation_path "${subject}" "${hemi}")"
+        output_copy="${subject_output_dir}/label/${hemi}.${subject}_${ANNOT_NAME}.annot"
+        log_file="${subject_output_dir}/logs/mri_surf2surf_${hemi}.log"
+
+        if [[ -f "${subject_annot}" ]]; then
+            info "Using existing ${hemi} annotation for ${subject}."
+            cp "${subject_annot}" "${output_copy}"
+            continue
+        fi
+
+        if [[ -f "${output_copy}" ]]; then
+            info "Restoring ${hemi} annotation for ${subject} from the output folder."
+            cp "${output_copy}" "${subject_annot}"
+            continue
+        fi
+
+        info "Mapping ${hemi} annotation to ${subject}."
+        mri_surf2surf \
+            --srcsubject fsaverage \
+            --trgsubject "${subject}" \
+            --hemi "${hemi}" \
+            --sval-annot "${source_annot}" \
+            --tval "${subject_annot}" \
+            >"${log_file}" 2>&1
+
+        cp "${subject_annot}" "${output_copy}"
+    done
+}
+
+map_labels_to_subject() {
+    local subject="$1"
+    local subject_output_dir="$2"
+    local hemi
+    local final_index
+    local region_hemi
+    local region_name
+    local label_file
+    local source_label
+    local target_label
+    local subject_annot
+    local output_copy
+    local log_file
+    local ctab_file
+    local -a label_args
+
+    mkdir -p "${subject_output_dir}/label" "${subject_output_dir}/logs"
+
+    for hemi in lh rh; do
+        subject_annot="$(subject_annotation_path "${subject}" "${hemi}")"
+        output_copy="${subject_output_dir}/label/${hemi}.${subject}_${ANNOT_NAME}.annot"
+
+        if [[ -f "${subject_annot}" ]]; then
+            info "Using existing ${hemi} annotation for ${subject}."
+            cp "${subject_annot}" "${output_copy}"
+            continue
+        fi
+
+        label_args=()
+        log_file="${subject_output_dir}/logs/mri_label2label_${hemi}.log"
+        : >"${log_file}"
+
+        while IFS=$'\t' read -r final_index region_hemi region_name label_file; do
+            [[ "${final_index}" == "index" ]] && continue
+            [[ "${region_hemi}" == "${hemi}" ]] || continue
+
+            source_label="${OUTPUT_DIR}/label/${label_file}"
+            target_label="${subject_output_dir}/label/${label_file}"
+
+            info "Mapping ${label_file} to ${subject}."
+            mri_label2label \
+                --srcsubject fsaverage \
+                --srclabel "${source_label}" \
+                --trgsubject "${subject}" \
+                --trglabel "${target_label}" \
+                --regmethod surface \
+                --hemi "${hemi}" \
+                >>"${log_file}" 2>&1
+
+            label_args+=(--l "${target_label}")
+        done <"${REGION_TABLE}"
+
+        ((${#label_args[@]} > 0)) || fail "No ${hemi} labels were available for ${subject}."
+
+        ctab_file="$(ctab_for_hemi "${hemi}")"
+        log_file="${subject_output_dir}/logs/mris_label2annot_${hemi}.log"
+
+        mris_label2annot \
+            --s "${subject}" \
+            --h "${hemi}" \
+            "${label_args[@]}" \
+            --a "${subject}_${ANNOT_NAME}" \
+            --ctab "${ctab_file}" \
+            >"${log_file}" 2>&1
+
+        cp "${subject_annot}" "${output_copy}"
+    done
+}
+
+map_annotations_to_subject() {
+    local subject="$1"
+    local subject_output_dir="$2"
+
+    if [[ "${MAPPING_MODE}" == "direct" ]]; then
+        map_annotations_direct_to_subject "${subject}" "${subject_output_dir}"
+    else
+        map_labels_to_subject "${subject}" "${subject_output_dir}"
+    fi
+}
+
+create_volume() {
+    local subject="$1"
+    local subject_output_dir="$2"
+    local raw_volume="${TEMP_DIR}/${subject}_${ANNOT_NAME}_raw.nii.gz"
+    local final_volume="${subject_output_dir}/${ANNOT_NAME}.nii.gz"
+    local log_file="${subject_output_dir}/logs/mri_aparc2aseg.log"
+
+    info "Creating parcellation volume."
+    mri_aparc2aseg \
+        --s "${subject}" \
+        --o "${raw_volume}" \
+        --annot "${subject}_${ANNOT_NAME}" \
+        >"${log_file}" 2>&1
+
+    apply_hippocampus_fix "${raw_volume}" "${final_volume}" "${subject}"
+}
+
+roi_index() {
+    local region_name="$1"
+
+    awk -v region_name="${region_name}" '$3 == region_name { print $1; exit }' "${MASTER_LUT}"
+}
+
+apply_hippocampus_fix() {
+    local input_volume="$1"
+    local output_volume="$2"
+    local subject="$3"
+    local current_volume="${input_volume}"
+    local left_index
+    local right_index
+    local hcp_mask
+    local fs_mask
+    local updated_volume
+
+    left_index="$(roi_index "L_H_ROI")"
+    right_index="$(roi_index "R_H_ROI")"
+
+    if [[ -z "${left_index}" && -z "${right_index}" ]]; then
+        warn "No H_ROI labels found for ${subject}; copying volume without hippocampus reassignment."
+        cp "${input_volume}" "${output_volume}"
+        return
+    fi
+
+    info "Reassigning H_ROI voxels to FreeSurfer hippocampus IDs."
+
+    if [[ -n "${left_index}" ]]; then
+        hcp_mask="${TEMP_DIR}/${subject}_left_h_roi.nii.gz"
+        fs_mask="${TEMP_DIR}/${subject}_left_fs_hippocampus.nii.gz"
+        updated_volume="${TEMP_DIR}/${subject}_after_left_hippocampus.nii.gz"
+
+        fslmaths "${current_volume}" -thr "${left_index}" -uthr "${left_index}" "${hcp_mask}"
+        fslmaths "${hcp_mask}" -bin -mul 17 "${fs_mask}"
+        fslmaths "${current_volume}" -sub "${hcp_mask}" -add "${fs_mask}" "${updated_volume}"
+        current_volume="${updated_volume}"
+    fi
+
+    if [[ -n "${right_index}" ]]; then
+        hcp_mask="${TEMP_DIR}/${subject}_right_h_roi.nii.gz"
+        fs_mask="${TEMP_DIR}/${subject}_right_fs_hippocampus.nii.gz"
+        updated_volume="${TEMP_DIR}/${subject}_after_right_hippocampus.nii.gz"
+
+        fslmaths "${current_volume}" -thr "${right_index}" -uthr "${right_index}" "${hcp_mask}"
+        fslmaths "${hcp_mask}" -bin -mul 53 "${fs_mask}"
+        fslmaths "${current_volume}" -sub "${hcp_mask}" -add "${fs_mask}" "${updated_volume}"
+        current_volume="${updated_volume}"
+    fi
+
+    cp "${current_volume}" "${output_volume}"
+}
+
+create_cortical_masks() {
+    local subject_output_dir="$1"
+    local final_volume="${subject_output_dir}/${ANNOT_NAME}.nii.gz"
+    local mask_dir="${subject_output_dir}/masks"
+    local index
+    local hemi
+    local region_name
+    local label_file
+
+    info "Creating cortical region masks."
+    mkdir -p "${mask_dir}"
+
+    tail -n +2 "${REGION_TABLE}" | while IFS=$'\t' read -r index hemi region_name label_file; do
+        case "${region_name}" in
+            L_H_ROI | R_H_ROI)
+                continue
+                ;;
+        esac
+
+        fslmaths "${final_volume}" \
+            -thr "${index}" \
+            -uthr "${index}" \
+            -bin "${mask_dir}/${region_name}.nii.gz"
+    done
+}
+
+create_aseg_masks() {
+    local subject_output_dir="$1"
+    local final_volume="${subject_output_dir}/${ANNOT_NAME}.nii.gz"
+    local aseg_mask_dir="${subject_output_dir}/aseg_masks"
+    local side
+    local structure
+    local full_name
+    local fs_index
+
+    info "Creating subcortical aseg masks."
+    mkdir -p "${aseg_mask_dir}"
+
+    for side in Left Right; do
+        for structure in Thalamus-Proper Caudate Pallidum Hippocampus Amygdala Accumbens-area; do
+            full_name="${side}-${structure}"
+            fs_index="$(awk -v name="${full_name}" '$2 == name { print $1; exit }' "${COLOR_LUT}")"
+
+            if [[ -z "${fs_index}" ]]; then
+                warn "Could not find '${full_name}' in ${COLOR_LUT}; skipping."
+                continue
+            fi
+
+            fslmaths "${final_volume}" \
+                -thr "${fs_index}" \
+                -uthr "${fs_index}" \
+                -bin "${aseg_mask_dir}/${full_name}.nii.gz"
+        done
+    done
+}
+
+create_stats_tables() {
+    local subject="$1"
+    local subject_output_dir="$2"
+    local hemi
+    local subject_annot
+    local stats_file
+    local log_file
+
+    info "Creating anatomical stats tables."
+    mkdir -p "${subject_output_dir}/tables"
+
+    for hemi in lh rh; do
+        subject_annot="$(subject_annotation_path "${subject}" "${hemi}")"
+        stats_file="${subject_output_dir}/tables/table_${hemi}.txt"
+        log_file="${subject_output_dir}/logs/mris_anatomical_stats_${hemi}.log"
+
+        mris_anatomical_stats \
+            -a "${subject_annot}" \
+            -f "${stats_file}" \
+            "${subject}" "${hemi}" \
+            >"${log_file}" 2>&1
+    done
+}
+
+validate_subject() {
+    local subject="$1"
+    local subject_dir="${SUBJECTS_DIR}/${subject}"
+    local required_file
+
+    [[ -d "${subject_dir}" ]] || fail "Subject '${subject}' was not found in ${SUBJECTS_DIR}."
+    [[ -d "${subject_dir}/label" ]] || fail "Subject '${subject}' is missing a label directory."
+
+    for required_file in \
+        mri/aseg.mgz \
+        mri/ribbon.mgz \
+        surf/lh.white \
+        surf/lh.pial \
+        surf/lh.sphere.reg \
+        surf/rh.white \
+        surf/rh.pial \
+        surf/rh.sphere.reg; do
+        [[ -f "${subject_dir}/${required_file}" ]] || fail "Subject '${subject}' is missing ${required_file}. Run recon-all first."
+    done
+}
+
+process_subjects() {
+    local subject
+    local subject_output_dir
+    local started_at
+    local subjects_to_process="${TEMP_DIR}/subjects_to_process.txt"
+
+    sed -n "${FIRST_ROW},${LAST_ROW}p" "${SUBJECT_LIST_FILE}" >"${subjects_to_process}"
+
+    while IFS= read -r subject || [[ -n "${subject}" ]]; do
+        subject="${subject%$'\r'}"
+        [[ -z "${subject}" ]] && continue
+        [[ "${subject}" =~ ^[[:space:]]*# ]] && continue
+
+        started_at="$(date)"
+        subject_output_dir="${OUTPUT_DIR}/${subject}"
+
+        log "Processing ${subject}"
+        validate_subject "${subject}"
+        mkdir -p "${subject_output_dir}/logs"
+
+        cp "${MASTER_LUT}" "${subject_output_dir}/LUT_${ANNOT_NAME}.txt"
+        sed -i.bak '/_H_ROI/d' "${subject_output_dir}/LUT_${ANNOT_NAME}.txt"
+        rm -f "${subject_output_dir}/LUT_${ANNOT_NAME}.txt.bak"
+
+        map_annotations_to_subject "${subject}" "${subject_output_dir}"
+        create_volume "${subject}" "${subject_output_dir}"
+
+        if [[ "${CREATE_MASKS}" == "YES" ]]; then
+            create_cortical_masks "${subject_output_dir}"
+        fi
+
+        if [[ "${CREATE_ASEG}" == "YES" ]]; then
+            create_aseg_masks "${subject_output_dir}"
+        fi
+
+        if [[ "${GET_STATS}" == "YES" ]]; then
+            create_stats_tables "${subject}" "${subject_output_dir}"
+        fi
+
+        info "${subject} started at ${started_at}; finished at $(date)."
+    done <"${subjects_to_process}"
+}
+
+FIRST_ROW=1
+LAST_ROW=""
+CREATE_MASKS=NO
+CREATE_ASEG=NO
+GET_STATS=YES
+MAPPING_MODE="${HCPMMP1_MAPPING_MODE:-labels}"
+
+while getopts ":L:f:l:a:d:m:t:s:h" option; do
+    case "${option}" in
+        L) SUBJECT_LIST_ARG="${OPTARG}" ;;
+        f) FIRST_ROW="${OPTARG}" ;;
+        l) LAST_ROW="${OPTARG}" ;;
+        a) ANNOT_NAME="${OPTARG}" ;;
+        d) OUTPUT_DIR_ARG="${OPTARG}" ;;
+        m) CREATE_MASKS="${OPTARG}" ;;
+        t) GET_STATS="${OPTARG}" ;;
+        s) CREATE_ASEG="${OPTARG}" ;;
+        h)
+            usage
+            exit 0
             ;;
-        a)
-            a=${OPTARG}
+        *)
+            usage
+            exit 1
             ;;
-        d)
-            d=${OPTARG}
-            ;;
-        m)
-            m=${OPTARG}
-            ;;
-	t)
-	    t=${OPTARG}
-	    ;;
-	s)
-	    s=${OPTARG}
-	    ;;
     esac
 done
 
-if [ -z "${L}" ] || [ -z "${a}" ] || [ -z "${d}" ]; then printf '\n Usage:\n	-To be run from the directory containing FreeSurfer subject folders, which should also contain the fsaverage folder. User must have writing permission. Original annotation files (eg, lh.HCPMMP1.annot, rh.HCPMMP1.annot) must be present in $SUBJECTS_DIR/fsaverage/label/, or in the base folder ($SUBJECTS_DIR/).\n	-Output: individual nifti volume, where regions are indicated by voxel values, is stored in each subject·s folder inside the output directory. Regions can then be identified through the region_index_table.txt stored in the output folder. Final annotation file in subject space is stored in original subject·s folder ($SUBJECTS_DIR/subject/label/), and will NOT ovewrite old files.\n\n Compulsory arguments:\n	-L <subject_list> (names must correspond to names of folders in $SUBJECTS_DIR)\n	-a <name_of_input_annot_file> (without specifying hemisphere and without extension. Usually, HCPMMP1)\n	-d <name_of_ouput_dir> \n\n Optional arguments:\n	-f: row in subject list indicating first subject to be processed\n	-l: row in subject list indicating last subject to be processed\n	-m <YES or NO> create individual nii.gz masks for cortical regions (requires FSL. Default is NO. Masks will be saved in /output_dir/subject/masks/)\n	-s <YES or NO> create individual nii.gz masks for 14 subcortical regions (from the FreeSurfer automatic segmentation. Requires the FreeSurferColorLUT.txt file in the base folder. Requires FSL. Defaults is NO)\n	-t <YES or NO> generate anatomical stats (mean area, volume, thickness, etc., per region. Saved in /output_dir/subject/tables/. Default is YES) table\n\n	2018 CJNeurolab\n	University of Barcelona\n	by Hugo C Baggio & Alexandra Abos\n\n'; exit 1; fi
+[[ -n "${SUBJECT_LIST_ARG:-}" ]] || { usage; fail "Missing required -L argument."; }
+[[ -n "${ANNOT_NAME:-}" ]] || { usage; fail "Missing required -a argument."; }
+[[ -n "${OUTPUT_DIR_ARG:-}" ]] || { usage; fail "Missing required -d argument."; }
 
-create_individual_masks=NO
-annotation_file=$a
-subject_list_all=$L
-output_dir=$d
-get_anatomical_stats=YES
-create_aseg_files=NO
+[[ -n "${SUBJECTS_DIR:-}" ]] || fail "SUBJECTS_DIR is not set."
+[[ -d "${SUBJECTS_DIR}" ]] || fail "SUBJECTS_DIR does not exist: ${SUBJECTS_DIR}"
+[[ -n "${FREESURFER_HOME:-}" ]] || fail "FREESURFER_HOME is not set. Source FreeSurfer's setup script before running."
+[[ -d "${FREESURFER_HOME}" ]] || fail "FREESURFER_HOME does not exist: ${FREESURFER_HOME}"
 
-if [ ! -z "${f}" ] ; then first=$f; else first=1; fi
-if [ ! -z "${l}" ] ; then last=$l; else last=`wc -l < ${subject_list_all}`; fi
-if [ ! -z "${m}" ] ; then create_individual_masks=$m; fi
-if [ ! -z "${s}" ] ; then create_aseg_files=$s; fi
-if [ ! -z "${t}" ] ; then get_anatomical_stats=$t; fi
- 
-printf "\n         >>>>         Current FreeSurfer subjects folder is $SUBJECTS_DIR\n\n"
-
-#Check if FreeSurferColorLUT.txt is present in base folder
-if [[ ${create_aseg_files} == "YES" ]]; then if [[ ! -e FreeSurferColorLUT.txt ]]; then printf "         >>>>         ERROR: FreeSurferColorLUT.txt file not found. Subcortical masks will NOT be created\n\n"; create_aseg_files=NO; colorlut_miss=YES; fi; fi
-
-# Create subject list with subjects defined in the input
-sed -n "${first},${last} p" ${subject_list_all} > temp_subject_list_${first}_${last}
-subject_list=temp_subject_list_${first}_${last}
-
-mkdir -p ${output_dir}
-mkdir -p ${output_dir}/label
-rand_id=$RANDOM
-mkdir -p ${output_dir}/temp_${first}_${last}_${rand_id}
-rm -f ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_?
-rm -f ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}?
-
-# Check whether original annotation files are in fsaverage/label folder, copy them if not
-if [[ ! -e $SUBJECTS_DIR/fsaverage/label/lh.${annotation_file}.annot ]]
-	then cp $SUBJECTS_DIR/lh.${annotation_file}.annot $SUBJECTS_DIR/fsaverage/label/
-fi
-if [[ ! -e $SUBJECTS_DIR/fsaverage/label/rh.${annotation_file}.annot ]] 
-	then cp $SUBJECTS_DIR/rh.${annotation_file}.annot $SUBJECTS_DIR/fsaverage/label/
+is_positive_integer "${FIRST_ROW}" || fail "-f must be a positive integer."
+if [[ -n "${LAST_ROW}" ]]; then
+    is_positive_integer "${LAST_ROW}" || fail "-l must be a positive integer."
 fi
 
-# Convert annotation to label, and get color lookup tables
-rm -f ./${output_dir}/log_annotation2label
-mri_annotation2label --subject fsaverage --hemi lh --outdir ./${output_dir}/label --annotation ${annotation_file} >> ./${output_dir}/temp_${first}_${last}_${rand_id}/log_annotation2label
-mri_annotation2label --subject fsaverage --hemi lh --outdir ./${output_dir}/label --annotation ${annotation_file} --ctab ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_L1 >> ./${output_dir}/temp_${first}_${last}_${rand_id}/log_annotation2label
-mri_annotation2label --subject fsaverage --hemi rh --outdir ./${output_dir}/label --annotation ${annotation_file} >> ./${output_dir}/temp_${first}_${last}_${rand_id}/log_annotation2label
-mri_annotation2label --subject fsaverage --hemi rh --outdir ./${output_dir}/label --annotation ${annotation_file} --ctab ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_R1 >> ./${output_dir}/temp_${first}_${last}_${rand_id}/log_annotation2label
+CREATE_MASKS="$(normalize_yes_no "-m" "${CREATE_MASKS}")"
+CREATE_ASEG="$(normalize_yes_no "-s" "${CREATE_ASEG}")"
+GET_STATS="$(normalize_yes_no "-t" "${GET_STATS}")"
 
-# Remove number columns from ctab
-awk '!($1="")' ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_L1 >> ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_L2
-awk '!($1="")' ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_R1 >> ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_R2
+case "${MAPPING_MODE}" in
+    labels | direct)
+        ;;
+    *)
+        fail "HCPMMP1_MAPPING_MODE must be 'labels' or 'direct', got '${MAPPING_MODE}'."
+        ;;
+esac
 
-# Create list with region names
-awk '{print $2}' ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_L1 > ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}L1
-awk '{print $2}' ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_R1 > ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}R1
+SUBJECT_LIST_FILE="$(resolve_subject_list "${SUBJECT_LIST_ARG}")"
+if [[ -z "${LAST_ROW}" ]]; then
+    LAST_ROW="$(wc -l <"${SUBJECT_LIST_FILE}" | tr -d '[:space:]')"
+fi
+is_positive_integer "${LAST_ROW}" || fail "Subject list is empty: ${SUBJECT_LIST_FILE}"
 
-# Create lists with regions that actually have corresponding labels
-for labelsL in `cat ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}L1`
-	do if [[ -e ${output_dir}/label/lh.${labelsL}.label ]]
-		then
-		echo lh.${labelsL}.label >> ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}L
-		grep " ${labelsL} " ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_L2 >> ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_L3
-	fi
-done
-for labelsR in `cat ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}R1`
-	do if [[ -e ${output_dir}/label/rh.${labelsR}.label ]]
-		then
-		echo rh.${labelsR}.label >> ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}R
-		grep " ${labelsR} " ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_R2 >> ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_R3
-	fi
-done
+((FIRST_ROW <= LAST_ROW)) || fail "-f cannot be greater than -l."
 
-# Create new numbers column
-number_labels_R=`wc -l < ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}R` 
-number_labels_L=`wc -l < ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}L`
+OUTPUT_DIR="$(resolve_output_dir "${OUTPUT_DIR_ARG}")"
+mkdir -p "${OUTPUT_DIR}"
 
-for ((i=1;i<=${number_labels_L};i+=1))
-	do num=`echo "${i}+1000" | bc`
-	printf "$num\n" >> ${output_dir}/temp_${first}_${last}_${rand_id}/LUT_number_table_${annotation_file}L
-	printf "$i\n" >> ${output_dir}/temp_${first}_${last}_${rand_id}/${annotation_file}_number_tableL
-done
-for ((i=1;i<=${number_labels_R};i+=1))
-	do num=`echo "${i}+2000" | bc`
-	printf "$num\n" >> ${output_dir}/temp_${first}_${last}_${rand_id}/LUT_number_table_${annotation_file}R
-	printf "$i\n" >> ${output_dir}/temp_${first}_${last}_${rand_id}/${annotation_file}_number_tableR
-done
+TEMP_DIR="$(mktemp -d "${OUTPUT_DIR}/.tmp.${SCRIPT_NAME}.XXXXXX")"
+trap cleanup EXIT
 
-# Create ctabs with actual regions
-paste ${output_dir}/temp_${first}_${last}_${rand_id}/${annotation_file}_number_tableL ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_L3 > ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_L
-paste ${output_dir}/temp_${first}_${last}_${rand_id}/LUT_number_table_${annotation_file}L ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}L > ${output_dir}/temp_${first}_${last}_${rand_id}/LUT_left_${annotation_file}
-paste ${output_dir}/temp_${first}_${last}_${rand_id}/${annotation_file}_number_tableR ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_R3 > ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_R
-paste ${output_dir}/temp_${first}_${last}_${rand_id}/LUT_number_table_${annotation_file}R ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}R > ${output_dir}/temp_${first}_${last}_${rand_id}/LUT_right_${annotation_file}
-cat ${output_dir}/temp_${first}_${last}_${rand_id}/LUT_left_${annotation_file} ${output_dir}/temp_${first}_${last}_${rand_id}/LUT_right_${annotation_file} > ${output_dir}/temp_${first}_${last}_${rand_id}/LUT_${annotation_file}.txt
+MASTER_LUT="${TEMP_DIR}/LUT_${ANNOT_NAME}.tsv"
+REGION_TABLE="${TEMP_DIR}/regions_${ANNOT_NAME}.tsv"
+COLOR_LUT=""
 
-# Take labels from fsaverage to subject space
-for subject in `cat ${subject_list}`
-	do printf "\n         >>>>         PREPROCESSING ${subject}         <<<< \n"
+require_command mri_annotation2label
+require_command mri_aparc2aseg
+require_command fslmaths
 
-	echo $(date) > ${output_dir}/temp_${first}_${last}_${rand_id}/start_date
-	echo "         >>>>         START TIME: `cat ${output_dir}/temp_${first}_${last}_${rand_id}/start_date`         <<<<"
-	mkdir -p ${output_dir}/${subject}
-	mkdir -p ${output_dir}/${subject}/label
-	sed '/_H_ROI/d' ${output_dir}/temp_${first}_${last}_${rand_id}/LUT_${annotation_file}.txt > ${output_dir}/${subject}/LUT_${annotation_file}.txt
+if [[ "${GET_STATS}" == "YES" ]]; then
+    require_command mris_anatomical_stats
+fi
 
-	if [[ -e $SUBJECTS_DIR/${subject}/label/lh.${subject}_${annotation_file}.annot ]] && [[ -e $SUBJECTS_DIR/${subject}/label/rh.${subject}_${annotation_file}.annot ]]
-		then
-		echo ">>>>	Annotation files lh.${subject}_${annotation_file}.annot and rh.${subject}_${annotation_file}.annot already exist in ${subject}/label. Won't perform transformations"
-		else
+if [[ "${MAPPING_MODE}" == "direct" ]]; then
+    require_command mri_surf2surf
+    warn "Using experimental direct annotation mapping. Validate outputs before production use."
+else
+    require_command mri_label2label
+    require_command mris_label2annot
+fi
 
-		rm -f ${output_dir}/${subject}/label2annot_${annotation_file}?h.log
-		rm -f ${output_dir}/${subject}/log_label2label
-		
-		for label in `cat ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}R`
-			do echo "transforming ${label}"
-			mri_label2label --srcsubject fsaverage --srclabel ${output_dir}/label/${label} --trgsubject ${subject} --trglabel ${output_dir}/${subject}/label/${label}.label --regmethod surface --hemi rh >> ${output_dir}/${subject}/log_label2label
-		done
-		for label in `cat ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}L`
-			do echo "transforming ${label}"
-			mri_label2label --srcsubject fsaverage --srclabel ${output_dir}/label/${label} --trgsubject ${subject} --trglabel ${output_dir}/${subject}/label/${label}.label --regmethod surface --hemi lh >> ${output_dir}/${subject}/log_label2label
-		done
+if [[ "${CREATE_ASEG}" == "YES" ]]; then
+    if COLOR_LUT="$(find_color_lut)"; then
+        info "Using FreeSurfer color LUT: ${COLOR_LUT}"
+    else
+        warn "FreeSurferColorLUT.txt was not found; subcortical masks will be skipped."
+        CREATE_ASEG=NO
+    fi
+fi
 
-		# Convert labels to annot (in subject space)
-		rm -f ${output_dir}/temp_${first}_${last}_${rand_id}/temp_cat_${annotation_file}_R
-		rm -f ${output_dir}/temp_${first}_${last}_${rand_id}/temp_cat_${annotation_file}_L
-		for labelsR in `cat ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}R`
-			do if [ -e ${output_dir}/${subject}/label/${labelsR} ]
-			then printf " --l ${output_dir}/${subject}/label/${labelsR}" >> ${output_dir}/temp_${first}${last}${rand_id}/temp_cat_${annotation_file}_R
-			fi
-			done
-		#for labelsR in `cat ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}R`
-		#	do printf " --l ${output_dir}/${subject}/label/${labelsR}" >> ${output_dir}/temp_${first}_${last}_${rand_id}/temp_cat_${annotation_file}_R
-		#done
-		for labelsL in `cat ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}L`
-			do if [ -e ${output_dir}/${subject}/label/${labelsL} ]
-				then printf " --l ${output_dir}/${subject}/label/${labelsL}" >> ${output_dir}/temp_${first}_${last}_${rand_id}/temp_cat_${annotation_file}_L
-			fi
-		done
-	
-		mris_label2annot --s ${subject} --h rh `cat ${output_dir}/temp_${first}_${last}_${rand_id}/temp_cat_${annotation_file}_R` --a ${subject}_${annotation_file} --ctab ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_R >> ${output_dir}/${subject}/label2annot_${annotation_file}rh.log 
-		mris_label2annot --s ${subject} --h lh `cat ${output_dir}/temp_${first}_${last}_${rand_id}/temp_cat_${annotation_file}_L` --a ${subject}_${annotation_file} --ctab ${output_dir}/temp_${first}_${last}_${rand_id}/colortab_${annotation_file}_L >> ${output_dir}/${subject}/label2annot_${annotation_file}lh.log 
+log "SUBJECTS_DIR: ${SUBJECTS_DIR}"
+log "Output directory: ${OUTPUT_DIR}"
+log "Mapping mode: ${MAPPING_MODE}"
 
-	fi
+ensure_annotation_files
+build_region_metadata
+process_subjects
 
-	# Convert annot to volume
-	rm -f ${output_dir}/${subject}/log_aparc2aseg
-	mri_aparc2aseg --s ${subject} --o ${output_dir}/temp_${first}_${last}_${rand_id}/${annotation_file}.nii.gz  --annot ${subject}_${annotation_file} >> ${output_dir}/${subject}/log_aparc2aseg
-
-	# Remove hippocampal 'residue' --> voxels assigned to hippocampus in the HCPMMP1.0 parcellation will be very few, corresponding to vertices around the actual structure. These will be given the same voxel values as the hippocampi (as defined by the FS automatic segmentation): 17 (L) and 53 (R)
-	l_hipp_index=`grep 'L_H_ROI.label' ${output_dir}/temp_${first}_${last}_${rand_id}/LUT_${annotation_file}.txt | cut -c-4`
-	r_hipp_index=`grep 'R_H_ROI.label' ${output_dir}/temp_${first}_${last}_${rand_id}/LUT_${annotation_file}.txt | cut -c-4`
-
-	fslmaths ${output_dir}/temp_${first}_${last}_${rand_id}/${annotation_file}.nii.gz -thr $l_hipp_index -uthr $l_hipp_index ${output_dir}/temp_${first}_${last}_${rand_id}/l_hipp_HCP
-	fslmaths ${output_dir}/temp_${first}_${last}_${rand_id}/l_hipp_HCP -bin -mul 17 ${output_dir}/temp_${first}_${last}_${rand_id}/l_hipp_FS
-
-	fslmaths ${output_dir}/temp_${first}_${last}_${rand_id}/${annotation_file}.nii.gz -thr $r_hipp_index -uthr $r_hipp_index -add ${output_dir}/temp_${first}_${last}_${rand_id}/l_hipp_HCP ${output_dir}/temp_${first}_${last}_${rand_id}/l_r_hipp_HCP
-	fslmaths ${output_dir}/temp_${first}_${last}_${rand_id}/${annotation_file}.nii.gz -thr $r_hipp_index -uthr $r_hipp_index -bin -mul 53 -add ${output_dir}/temp_${first}_${last}_${rand_id}/l_hipp_FS ${output_dir}/temp_${first}_${last}_${rand_id}/l_r_hipp_FS
-
-	fslmaths ${output_dir}/temp_${first}_${last}_${rand_id}/${annotation_file}.nii.gz -sub ${output_dir}/temp_${first}_${last}_${rand_id}/l_r_hipp_HCP -add ${output_dir}/temp_${first}_${last}_${rand_id}/l_r_hipp_FS ${output_dir}/${subject}/${annotation_file}.nii.gz
-
-	# Create individual mask files
-	if [[ ${create_individual_masks} == "YES" ]]
-		then 
-		printf ">> Creating individual region masks for subject ${subject}\n"
-		mkdir -p ${output_dir}/${subject}/masks
-		for ((i=1;i<=${number_labels_L};i+=1))
-			do num=`echo "${i}+1000" | bc`
-			if [[ $num != $l_hipp_index ]]
-				then
-				temp_region=`sed -n "$i,$i p" ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}L1`
-				echo "Mask left hemisphere: $i ${temp_region}"
-				fslmaths ${output_dir}/${subject}/${annotation_file}.nii.gz -thr ${num} -uthr ${num} -bin ${output_dir}/${subject}/masks/${temp_region}
-				else
-				echo ">> Skipping left hippocampus"
-			fi
-		done
-		for ((i=1;i<=${number_labels_R};i+=1))
-			do num=`echo "${i}+2000" | bc`
-			if [[ $num != $r_hipp_index ]]
-				then
-				temp_region=`sed -n "$i,$i p" ${output_dir}/temp_${first}_${last}_${rand_id}/list_labels_${annotation_file}R1`
-				echo "Mask right hemisphere: $i ${temp_region}"
-				fslmaths ${output_dir}/${subject}/${annotation_file}.nii.gz -thr ${num} -uthr ${num} -bin ${output_dir}/${subject}/masks/${temp_region}
-				else
-				echo ">> Skipping right hippocampus"
-			fi
-		done
-
-	fi
-
-	# Create individual subcortical masks
-	if [[ ${create_aseg_files} == "YES" ]]
-		then
-		mkdir -p ${output_dir}/${subject}/aseg_masks
-		printf ">> Creating subcortical aseg masks for subject ${subject}\n"
-		if [[ -e ${output_dir}/${subject}/aseg_masks/list_aseg ]]; then rm ${output_dir}/${subject}/aseg_masks/list_aseg; fi
-		for side in Left Right
-			do printf "$side-Thalamus-Proper\n$side-Caudate\n$side-Pallidum\n$side-Hippocampus\n$side-Amygdala\n$side-Accumbens-area\n" >> ${output_dir}/${subject}/aseg_masks/list_aseg
-		done
-		
-		for rois in `cat ${output_dir}/${subject}/aseg_masks/list_aseg`
-			do roi_index=`grep "${rois} " FreeSurferColorLUT.txt | cut -c-2` # the space after ${rois} is not casual
-			fslmaths ${output_dir}/${subject}/${annotation_file}.nii.gz -thr ${roi_index} -uthr ${roi_index} -bin ${output_dir}/${subject}/aseg_masks/${rois}
-		done
-
-	fi
-
-	# Get anatomical stats table
-	if [[ ${get_anatomical_stats} == "YES" ]]
-		then
-		mkdir -p ${output_dir}/${subject}/tables
-		mris_anatomical_stats -a $SUBJECTS_DIR/${subject}/label/lh.${subject}_${annotation_file}.annot -b ${subject} lh > ${output_dir}/temp_${first}_${last}_${rand_id}/table_lh.txt
-		sed '/_H_ROI/d; /???/d' ${output_dir}/temp_${first}_${last}_${rand_id}/table_lh.txt > ${output_dir}/${subject}/tables/table_lh.txt
-		mris_anatomical_stats -a $SUBJECTS_DIR/${subject}/label/rh.${subject}_${annotation_file}.annot -b ${subject} rh > ${output_dir}/temp_${first}_${last}_${rand_id}/table_rh.txt
-		sed '/_H_ROI/d; /???/d' ${output_dir}/temp_${first}_${last}_${rand_id}/table_rh.txt > ${output_dir}/${subject}/tables/table_rh.txt
-		
-		# Get tables with numerical values only
-		grep -n 'structure' ${output_dir}/${subject}/tables/table_lh.txt > ${output_dir}/temp_${first}_${last}_${rand_id}/temp_line_structure_name
-		grep -Eo '[0-9]{1,4}' ${output_dir}/temp_${first}_${last}_${rand_id}/temp_line_structure_name > ${output_dir}/temp_${first}_${last}_${rand_id}/temp_line_structure_name2
-		line_structure_name=`cat ${output_dir}/temp_${first}_${last}_${rand_id}/temp_line_structure_name2`
-		post_end_line=`echo "1+${line_structure_name}" | bc`
-		sed "1,${post_end_line}d" ${output_dir}/${subject}/tables/table_rh.txt > ${output_dir}/${subject}/tables/table_rh_values
-		sed "1,${post_end_line}d" ${output_dir}/${subject}/tables/table_lh.txt > ${output_dir}/${subject}/tables/table_lh_values
-		sed -i -r 's/\S+//10' ${output_dir}/${subject}/tables/table_lh_values
-		sed -i -r 's/\S+//10' ${output_dir}/${subject}/tables/table_rh_values
-
-		# Get variable names
-		grep -n 'number of vertices' ${output_dir}/${subject}/tables/table_lh.txt > ${output_dir}/temp_${first}_${last}_${rand_id}/temp_number_vert
-		grep -Eo '[0-9]{1,4}' ${output_dir}/temp_${first}_${last}_${rand_id}/temp_number_vert > ${output_dir}/temp_${first}_${last}_${rand_id}/temp_number_vert2
-		line_number_vert=`cat ${output_dir}/temp_${first}_${last}_${rand_id}/temp_number_vert2`
-		pre_number_vert=`echo "${line_number_vert}-1" | bc`
-		
-		number_lines=`wc -l < ${output_dir}/${subject}/tables/table_rh.txt`
-		sed "1,${pre_number_vert}d;${post_end_line},${number_lines}d" ${output_dir}/${subject}/tables/table_rh.txt > ${output_dir}/temp_${first}_${last}_${rand_id}/rh_mri_anatomical_stats_variables.txt
-		cut -c5- ${output_dir}/temp_${first}_${last}_${rand_id}/rh_mri_anatomical_stats_variables.txt > ${output_dir}/temp_${first}_${last}_${rand_id}/rh_mri_anatomical_stats_variables2.txt 
-		sed -i 's/ /_/g' ${output_dir}/temp_${first}_${last}_${rand_id}/rh_mri_anatomical_stats_variables2.txt        
-		awk '{ for (f = 1; f <= NF; f++)   a[NR, f] = $f  }  NF > nf { nf = NF } END {   for (f = 1; f <= nf; f++) for (r = 1; r <= NR; r++)     printf a[r, f] (r==NR ? RS : FS)  }' ${output_dir}/temp_${first}_${last}_${rand_id}/rh_mri_anatomical_stats_variables2.txt > ${output_dir}/${subject}/tables/rh_mri_anatomical_stats_variables
-
-		sed "1,${pre_number_vert}d;${post_end_line},${number_lines}d" ${output_dir}/${subject}/tables/table_lh.txt > ${output_dir}/temp_${first}_${last}_${rand_id}/lh_mri_anatomical_stats_variables.txt
-		cut -c5- ${output_dir}/temp_${first}_${last}_${rand_id}/lh_mri_anatomical_stats_variables.txt > ${output_dir}/temp_${first}_${last}_${rand_id}/lh_mri_anatomical_stats_variables2.txt 
-		sed -i 's/ /_/g' ${output_dir}/temp_${first}_${last}_${rand_id}/lh_mri_anatomical_stats_variables2.txt        
-		awk '{ for (f = 1; f <= NF; f++)   a[NR, f] = $f  }  NF > nf { nf = NF } END {   for (f = 1; f <= nf; f++) for (r = 1; r <= NR; r++)     printf a[r, f] (r==NR ? RS : FS)  }' ${output_dir}/temp_${first}_${last}_${rand_id}/lh_mri_anatomical_stats_variables2.txt > ${output_dir}/${subject}/tables/lh_mri_anatomical_stats_variables
-
-	fi
-
-	if [[ ${colorlut_miss} == "YES" ]]; then printf "\n         >>>>         ERROR: FreeSurferColorLUT.txt file not found. Individual subcortical masks NOT created\n"; fi
-
-	printf "\n         >>>>         ${subject} STARTED AT `cat ${output_dir}/temp_${first}_${last}_${rand_id}/start_date`, ENDED AT: $(date)\n\n"
-
-done
-
-rm -r ${output_dir}/temp_${first}_${last}_${rand_id}
-
-rm ${subject_list}
+log "Processing complete"
