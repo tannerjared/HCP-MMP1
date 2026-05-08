@@ -37,8 +37,8 @@ as the default path, but the implementation is cleaned up and easier to inspect.
 - The `fsaverage` subject in `$SUBJECTS_DIR/fsaverage`.
 - FSL's `fslmaths`, used for hippocampus reassignment and optional masks.
 - HCP-MMP1 annotation files:
-  - `lh.HCPMMP1.annot`
-  - `rh.HCPMMP1.annot`
+  - `lh.HCP-MMP1.annot`
+  - `rh.HCP-MMP1.annot`
 
 Place the annotation files in `$SUBJECTS_DIR/fsaverage/label/`. If they are in
 the root of `$SUBJECTS_DIR`, the script will copy them into `fsaverage/label/`.
@@ -51,13 +51,13 @@ For subcortical aseg masks (`-s YES`), the script looks for
 Use the main script for normal processing:
 
 ```bash
-./create_subj_volume_parcellation.sh -L subject_list.txt -a HCPMMP1 -d HCPMMP_parcellation
+./create_subj_volume_parcellation.sh -L subject_list.txt -a HCP-MMP1 -d HCPMMP_parcellation
 ```
 
 The optimized script is intentionally marked as experimental:
 
 ```bash
-./create_subj_volume_parcellation_optimized.sh -L subject_list.txt -a HCPMMP1 -d HCPMMP_parcellation
+./create_subj_volume_parcellation_optimized.sh -L subject_list.txt -a HCP-MMP1 -d HCPMMP_parcellation
 ```
 
 It sets `HCPMMP1_MAPPING_MODE=direct` and uses direct annotation transfer. Before
@@ -67,7 +67,7 @@ with known-good results.
 ## Usage
 
 ```bash
-./create_subj_volume_parcellation.sh -L subject_list.txt -a HCPMMP1 -d HCPMMP_parcellation
+./create_subj_volume_parcellation.sh -L subject_list.txt -a HCP-MMP1 -d HCPMMP_parcellation
 ```
 
 Required options:
@@ -75,7 +75,7 @@ Required options:
 | Option | Description |
 | --- | --- |
 | `-L <file>` | Text file containing subject IDs, one per line. Relative paths are checked from the current directory and then from `$SUBJECTS_DIR`. |
-| `-a <name>` | Annotation basename without hemisphere or extension, such as `HCPMMP1`. |
+| `-a <name>` | Annotation basename without hemisphere or extension, such as `HCP-MMP1`. |
 | `-d <dir>` | Output directory. Relative paths are created inside `$SUBJECTS_DIR`. |
 
 Optional options:
@@ -91,7 +91,7 @@ Optional options:
 Process all subjects:
 
 ```bash
-./create_subj_volume_parcellation.sh -L subject_list.txt -a HCPMMP1 -d HCPMMP_parcellation
+./create_subj_volume_parcellation.sh -L subject_list.txt -a HCP-MMP1 -d HCPMMP_parcellation
 ```
 
 Process rows 1 through 5 and create cortical and subcortical masks:
@@ -101,7 +101,7 @@ Process rows 1 through 5 and create cortical and subcortical masks:
   -L subject_list.txt \
   -f 1 \
   -l 5 \
-  -a HCPMMP1 \
+  -a HCP-MMP1 \
   -d HCPMMP_parcellation \
   -m YES \
   -s YES
