@@ -32,6 +32,8 @@ checked against the default path before it is used for analysis.
   automatically.
 - Inputs, required tools, and missing subject data are checked before each
   subject is processed.
+- Empty labels emitted by `mri_annotation2label` are skipped so the
+  label-by-label workflow does not stop on regions with zero fsaverage vertices.
 - `validate_optimized_output.sh` runs the default and optimized workflows into
   separate folders and compares the resulting NIfTI volumes.
 - Python post-processing is used automatically when `nibabel` and `numpy` are

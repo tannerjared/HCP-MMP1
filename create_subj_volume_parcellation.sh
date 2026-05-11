@@ -210,6 +210,7 @@ build_region_metadata() {
     local ctab_file
     local clean_ctab_file
     local log_file
+    local skipped_labels_file
 
     log "Reading annotation metadata from fsaverage"
     mkdir -p "${atlas_label_dir}" "${OUTPUT_DIR}/logs"
@@ -228,9 +229,11 @@ build_region_metadata() {
 
         ctab_file="${TEMP_DIR}/${hemi}.${ANNOT_NAME}.raw.ctab"
         clean_ctab_file="$(ctab_for_hemi "${hemi}")"
+        skipped_labels_file="${TEMP_DIR}/${hemi}.${ANNOT_NAME}.empty_labels.txt"
         log_file="${OUTPUT_DIR}/logs/mri_annotation2label_${hemi}.log"
 
         : >"${clean_ctab_file}"
+        : >"${skipped_labels_file}"
 
         mri_annotation2label \
             --subject fsaverage \
@@ -245,6 +248,7 @@ build_region_metadata() {
             -v hemi="${hemi}" \
             -v label_dir="${atlas_label_dir}" \
             -v clean_ctab="${clean_ctab_file}" \
+            -v skipped_labels="${skipped_labels_file}" \
             -v master_lut="${MASTER_LUT}" \
             -v region_table="${REGION_TABLE}" '
             NF >= 6 && $1 ~ /^[0-9]+$/ {
@@ -257,16 +261,34 @@ build_region_metadata() {
                 label_file = hemi "." region_name ".label"
                 label_path = label_dir "/" label_file
 
-                if ((getline first_line < label_path) >= 0) {
+                if ((getline first_line < label_path) < 0) {
                     close(label_path)
-                    local_index++
-                    final_index = base + local_index
-                    printf "%d\t%s\t%s\t%s\t%s\t%s\n", local_index, region_name, $3, $4, $5, $6 >> clean_ctab
-                    printf "%d\t%s\t%s\n", final_index, label_file, region_name >> master_lut
-                    printf "%d\t%s\t%s\t%s\n", final_index, hemi, region_name, label_file >> region_table
+                    next
                 }
+
+                if ((getline vertex_count < label_path) < 0) {
+                    close(label_path)
+                    next
+                }
+
+                close(label_path)
+
+                if (vertex_count + 0 <= 0) {
+                    print label_file >> skipped_labels
+                    next
+                }
+
+                local_index++
+                final_index = base + local_index
+                printf "%d\t%s\t%s\t%s\t%s\t%s\n", local_index, region_name, $3, $4, $5, $6 >> clean_ctab
+                printf "%d\t%s\t%s\n", final_index, label_file, region_name >> master_lut
+                printf "%d\t%s\t%s\t%s\n", final_index, hemi, region_name, label_file >> region_table
             }
         ' "${ctab_file}"
+
+        if [[ -s "${skipped_labels_file}" ]]; then
+            warn "Skipping empty ${hemi} labels from ${ANNOT_NAME}: $(tr '\n' ' ' <"${skipped_labels_file}")"
+        fi
     done
 }
 
