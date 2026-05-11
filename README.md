@@ -9,12 +9,16 @@ anatomical stats tables.
 The script is based on the CJ Neurolab workflow by Hugo C. Baggio and Alexandra
 Abos. The maintained script keeps the original label-by-label mapping workflow
 as the default path, but the implementation is cleaned up and easier to inspect.
+Validation and post-processing helpers are included so the optimized path can be
+checked against the default path before it is used for analysis.
 
 ## What Changed
 
 - `create_subj_volume_parcellation.sh` is the main maintained script.
 - `create_subj_volume_parcellation_optimized.sh` is an experimental
-  entry point because the newer optimized approach has not been fully validated. I've done limited testing and it produced the same results as the other method, but do your own verification.
+  entry point because the newer optimized approach has not been fully validated.
+  Limited testing has produced the same results as the default method, but
+  verify it with your own data before using it for analysis.
 - The default script still maps labels with `mri_label2label` and rebuilds
   annotations with `mris_label2annot`, matching the established CJ Neurolab
   workflow more closely.
@@ -28,6 +32,15 @@ as the default path, but the implementation is cleaned up and easier to inspect.
   automatically.
 - Inputs, required tools, and missing subject data are checked before each
   subject is processed.
+- Empty labels emitted by `mri_annotation2label` are skipped so the
+  label-by-label workflow does not stop on regions with zero fsaverage vertices.
+- `validate_optimized_output.sh` runs the default and optimized workflows into
+  separate folders and compares the resulting NIfTI volumes.
+- Python post-processing is used automatically when `nibabel` and `numpy` are
+  available. It reduces repeated `fslmaths` calls for hippocampus reassignment
+  and mask generation. If Python dependencies are unavailable, the script falls
+  back to `fslmaths`.
+- Subjects can be processed in parallel with `-j`.
 
 ## Requirements
 
@@ -35,10 +48,19 @@ as the default path, but the implementation is cleaned up and easier to inspect.
 - FreeSurfer with `FREESURFER_HOME` and `SUBJECTS_DIR` set.
 - A completed FreeSurfer `recon-all` directory for each subject.
 - The `fsaverage` subject in `$SUBJECTS_DIR/fsaverage`.
-- FSL's `fslmaths`, used for hippocampus reassignment and optional masks.
+- Either Python with `nibabel` and `numpy`, or FSL's `fslmaths`, for
+  hippocampus reassignment and optional masks.
+- Python with `nibabel` and `numpy` for `validate_optimized_output.sh` and
+  `compare_parcellations.py`.
 - HCP-MMP1 annotation files:
   - `lh.HCP-MMP1.annot`
   - `rh.HCP-MMP1.annot`
+
+If needed, install the Python dependencies into your working environment:
+
+```bash
+conda install -c conda-forge nibabel numpy
+```
 
 Place the annotation files in `$SUBJECTS_DIR/fsaverage/label/`. If they are in
 the root of `$SUBJECTS_DIR`, the script will copy them into `fsaverage/label/`.
@@ -67,6 +89,28 @@ It sets `HCPMMP1_MAPPING_MODE=direct` and uses direct annotation transfer. Befor
 using it for analysis, compare its output against the main script for a subject
 with known-good results.
 
+Use the validation wrapper to run both paths and compare the final volumes:
+
+```bash
+./validate_optimized_output.sh \
+  -L subject_list.txt \
+  -a HCP-MMP1 \
+  -d HCPMMP_validation \
+  -f 1 \
+  -l 1
+```
+
+The validation wrapper writes:
+
+- `labels/`: output from `create_subj_volume_parcellation.sh`.
+- `direct/`: output from `create_subj_volume_parcellation_optimized.sh`.
+- `comparison/`: JSON and TSV comparison summaries for each subject.
+
+The wrapper forces both workflows to recreate the subject annotation files so
+the comparison cannot accidentally reuse a previous result. It backs up and
+restores the original subject annotation files in `$SUBJECTS_DIR/<subject>/label/`
+when it finishes.
+
 ## Usage
 
 ```bash
@@ -90,6 +134,8 @@ Optional options:
 | `-m <YES\|NO>` | `NO` | Create individual cortical region masks. |
 | `-s <YES\|NO>` | `NO` | Create individual subcortical aseg masks. |
 | `-t <YES\|NO>` | `YES` | Create anatomical stats tables. |
+| `-r <YES\|NO>` | `NO` | Recreate subject annotation files even when they already exist. Useful for validation. |
+| `-j <int>` | `1` | Number of subjects to process at once. |
 
 Process all subjects:
 
@@ -107,8 +153,27 @@ Process rows 1 through 5 and create cortical and subcortical masks:
   -a HCP-MMP1 \
   -d HCPMMP_parcellation \
   -m YES \
-  -s YES
+  -s YES \
+  -j 2
 ```
+
+By default, post-processing uses Python when `nibabel` and `numpy` are available
+and falls back to `fslmaths` otherwise. To force one backend:
+
+```bash
+HCPMMP1_POSTPROCESS=python ./create_subj_volume_parcellation.sh \
+  -L subject_list.txt \
+  -a HCP-MMP1 \
+  -d HCPMMP_parcellation
+
+HCPMMP1_POSTPROCESS=fsl ./create_subj_volume_parcellation.sh \
+  -L subject_list.txt \
+  -a HCP-MMP1 \
+  -d HCPMMP_parcellation
+```
+
+If Python is installed somewhere unusual, set `HCPMMP1_PYTHON` to that Python
+executable.
 
 ## Output
 
@@ -144,7 +209,8 @@ values to region names.
 If a subject already has
 `lh.<subject>_<annotation_name>.annot` and
 `rh.<subject>_<annotation_name>.annot` in its FreeSurfer `label/` folder, the
-script reuses those files instead of overwriting them.
+script reuses those files instead of overwriting them. Use `-r YES` when you
+need to recreate them for validation.
 
 ## References
 
