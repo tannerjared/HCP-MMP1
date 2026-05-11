@@ -8,6 +8,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+POSTPROCESS_HELPER="${SCRIPT_DIR}/hcp_mmp1_postprocess.py"
 
 usage() {
     cat <<EOF
@@ -18,7 +20,7 @@ Usage:
 Required arguments:
   -L <file>     Text file containing FreeSurfer subject IDs.
   -a <name>     Annotation basename without hemisphere or extension.
-                Example: HCPMMP1 for lh.HCPMMP1.annot and rh.HCPMMP1.annot.
+                Example: HCP-MMP1 for lh.HCP-MMP1.annot and rh.HCP-MMP1.annot.
   -d <dir>      Output directory. Relative paths are created inside SUBJECTS_DIR.
 
 Optional arguments:
@@ -27,11 +29,13 @@ Optional arguments:
   -m <YES|NO>   Create one cortical mask per region. Default: NO.
   -s <YES|NO>   Create subcortical aseg masks. Default: NO.
   -t <YES|NO>   Create anatomical stats tables. Default: YES.
+  -r <YES|NO>   Recreate subject annotation files if they already exist. Default: NO.
+  -j <int>      Number of subjects to process at once. Default: 1.
   -h            Show this help text.
 
 Examples:
-  ${SCRIPT_NAME} -L subject_list.txt -a HCPMMP1 -d HCPMMP_parcellation
-  ${SCRIPT_NAME} -L subject_list.txt -f 1 -l 5 -a HCPMMP1 -d HCPMMP_parcellation -m YES -s YES
+  ${SCRIPT_NAME} -L subject_list.txt -a HCP-MMP1 -d HCPMMP_parcellation
+  ${SCRIPT_NAME} -L subject_list.txt -f 1 -l 5 -a HCP-MMP1 -d HCPMMP_parcellation -m YES -s YES
 
 EOF
 }
@@ -84,6 +88,50 @@ require_command() {
     if ! command -v "${command_name}" >/dev/null 2>&1; then
         fail "Required command '${command_name}' was not found in PATH."
     fi
+}
+
+find_python() {
+    if [[ -n "${HCPMMP1_PYTHON:-}" ]]; then
+        command -v "${HCPMMP1_PYTHON}" 2>/dev/null
+        return
+    fi
+
+    command -v python3 2>/dev/null || command -v python 2>/dev/null
+}
+
+python_postprocess_available() {
+    [[ -f "${POSTPROCESS_HELPER}" ]] || return 1
+
+    if [[ -z "${PYTHON_BIN:-}" ]]; then
+        PYTHON_BIN="$(find_python)" || return 1
+    fi
+
+    "${PYTHON_BIN}" "${POSTPROCESS_HELPER}" check-dependencies >/dev/null 2>&1
+}
+
+configure_postprocess_backend() {
+    case "${POSTPROCESS_BACKEND}" in
+        auto)
+            if python_postprocess_available; then
+                POSTPROCESS_BACKEND=python
+                return
+            fi
+
+            require_command fslmaths
+            POSTPROCESS_BACKEND=fsl
+            ;;
+        python)
+            if ! python_postprocess_available; then
+                fail "Python post-processing needs Python with nibabel and numpy. Set HCPMMP1_POSTPROCESS=fsl to use fslmaths instead."
+            fi
+            ;;
+        fsl)
+            require_command fslmaths
+            ;;
+        *)
+            fail "HCPMMP1_POSTPROCESS must be auto, python, or fsl; got '${POSTPROCESS_BACKEND}'."
+            ;;
+    esac
 }
 
 resolve_subject_list() {
@@ -253,16 +301,20 @@ map_annotations_direct_to_subject() {
         output_copy="${subject_output_dir}/label/${hemi}.${subject}_${ANNOT_NAME}.annot"
         log_file="${subject_output_dir}/logs/mri_surf2surf_${hemi}.log"
 
-        if [[ -f "${subject_annot}" ]]; then
+        if [[ -f "${subject_annot}" && "${REMAP_ANNOTATIONS}" == "NO" ]]; then
             info "Using existing ${hemi} annotation for ${subject}."
             cp "${subject_annot}" "${output_copy}"
             continue
         fi
 
-        if [[ -f "${output_copy}" ]]; then
+        if [[ -f "${output_copy}" && "${REMAP_ANNOTATIONS}" == "NO" ]]; then
             info "Restoring ${hemi} annotation for ${subject} from the output folder."
             cp "${output_copy}" "${subject_annot}"
             continue
+        fi
+
+        if [[ -f "${subject_annot}" ]]; then
+            info "Replacing existing ${hemi} annotation for ${subject}."
         fi
 
         info "Mapping ${hemi} annotation to ${subject}."
@@ -300,10 +352,14 @@ map_labels_to_subject() {
         subject_annot="$(subject_annotation_path "${subject}" "${hemi}")"
         output_copy="${subject_output_dir}/label/${hemi}.${subject}_${ANNOT_NAME}.annot"
 
-        if [[ -f "${subject_annot}" ]]; then
+        if [[ -f "${subject_annot}" && "${REMAP_ANNOTATIONS}" == "NO" ]]; then
             info "Using existing ${hemi} annotation for ${subject}."
             cp "${subject_annot}" "${output_copy}"
             continue
+        fi
+
+        if [[ -f "${subject_annot}" ]]; then
+            info "Replacing existing ${hemi} annotation for ${subject}."
         fi
 
         label_args=()
@@ -381,6 +437,27 @@ roi_index() {
     awk -v region_name="${region_name}" '$3 == region_name { print $1; exit }' "${MASTER_LUT}"
 }
 
+run_python_hippocampus_fix() {
+    local input_volume="$1"
+    local output_volume="$2"
+    local left_index="$3"
+    local right_index="$4"
+    local -a args
+
+    args=(
+        "${PYTHON_BIN}"
+        "${POSTPROCESS_HELPER}"
+        hippocampus-fix
+        --input "${input_volume}"
+        --output "${output_volume}"
+    )
+
+    [[ -n "${left_index}" ]] && args+=(--left-index "${left_index}")
+    [[ -n "${right_index}" ]] && args+=(--right-index "${right_index}")
+
+    "${args[@]}"
+}
+
 apply_hippocampus_fix() {
     local input_volume="$1"
     local output_volume="$2"
@@ -402,6 +479,11 @@ apply_hippocampus_fix() {
     fi
 
     info "Reassigning H_ROI voxels to FreeSurfer hippocampus IDs."
+
+    if [[ "${POSTPROCESS_BACKEND}" == "python" ]]; then
+        run_python_hippocampus_fix "${input_volume}" "${output_volume}" "${left_index}" "${right_index}"
+        return
+    fi
 
     if [[ -n "${left_index}" ]]; then
         hcp_mask="${TEMP_DIR}/${subject}_left_h_roi.nii.gz"
@@ -428,6 +510,32 @@ apply_hippocampus_fix() {
     cp "${current_volume}" "${output_volume}"
 }
 
+run_python_mask_writer() {
+    local final_volume="$1"
+    local mask_spec="$2"
+    local mask_dir="$3"
+
+    if [[ ! -s "${mask_spec}" ]]; then
+        warn "No mask definitions were available for ${mask_dir}; skipping."
+        return
+    fi
+
+    "${PYTHON_BIN}" "${POSTPROCESS_HELPER}" write-masks \
+        --volume "${final_volume}" \
+        --spec "${mask_spec}" \
+        --output-dir "${mask_dir}"
+}
+
+prepare_cortical_mask_spec() {
+    CORTICAL_MASK_SPEC="${TEMP_DIR}/cortical_mask_spec.tsv"
+
+    awk -F $'\t' '
+        NR > 1 && $3 != "L_H_ROI" && $3 != "R_H_ROI" {
+            print $1 "\t" $3
+        }
+    ' "${REGION_TABLE}" >"${CORTICAL_MASK_SPEC}"
+}
+
 create_cortical_masks() {
     local subject_output_dir="$1"
     local final_volume="${subject_output_dir}/${ANNOT_NAME}.nii.gz"
@@ -439,6 +547,11 @@ create_cortical_masks() {
 
     info "Creating cortical region masks."
     mkdir -p "${mask_dir}"
+
+    if [[ "${POSTPROCESS_BACKEND}" == "python" ]]; then
+        run_python_mask_writer "${final_volume}" "${CORTICAL_MASK_SPEC}" "${mask_dir}"
+        return
+    fi
 
     tail -n +2 "${REGION_TABLE}" | while IFS=$'\t' read -r index hemi region_name label_file; do
         case "${region_name}" in
@@ -481,6 +594,42 @@ create_aseg_mask() {
         -bin "${aseg_mask_dir}/${structure_name}.nii.gz"
 }
 
+append_aseg_mask_spec() {
+    local mask_spec="$1"
+    local structure_name="$2"
+    local fs_index
+
+    if ! fs_index="$(lut_index_for_name "${structure_name}")"; then
+        warn "Could not find '${structure_name}' in ${COLOR_LUT}; skipping."
+        return
+    fi
+
+    printf '%s\t%s\n' "${fs_index}" "${structure_name}" >>"${mask_spec}"
+}
+
+prepare_aseg_mask_spec() {
+    local side
+    local structure
+    local thalamus_name
+
+    ASEG_MASK_SPEC="${TEMP_DIR}/aseg_mask_spec.tsv"
+    : >"${ASEG_MASK_SPEC}"
+
+    for side in Left Right; do
+        if lut_index_for_name "${side}-Thalamus-Proper" >/dev/null; then
+            thalamus_name="${side}-Thalamus-Proper"
+        else
+            thalamus_name="${side}-Thalamus"
+        fi
+
+        append_aseg_mask_spec "${ASEG_MASK_SPEC}" "${thalamus_name}"
+
+        for structure in Caudate Pallidum Hippocampus Amygdala Accumbens-area; do
+            append_aseg_mask_spec "${ASEG_MASK_SPEC}" "${side}-${structure}"
+        done
+    done
+}
+
 create_aseg_masks() {
     local subject_output_dir="$1"
     local final_volume="${subject_output_dir}/${ANNOT_NAME}.nii.gz"
@@ -491,6 +640,11 @@ create_aseg_masks() {
 
     info "Creating subcortical aseg masks."
     mkdir -p "${aseg_mask_dir}"
+
+    if [[ "${POSTPROCESS_BACKEND}" == "python" ]]; then
+        run_python_mask_writer "${final_volume}" "${ASEG_MASK_SPEC}" "${aseg_mask_dir}"
+        return
+    fi
 
     for side in Left Right; do
         if lut_index_for_name "${side}-Thalamus-Proper" >/dev/null; then
@@ -552,47 +706,91 @@ validate_subject() {
     done
 }
 
-process_subjects() {
+process_one_subject() {
     local subject
     local subject_output_dir
     local started_at
+
+    subject="$1"
+    started_at="$(date)"
+    subject_output_dir="${OUTPUT_DIR}/${subject}"
+
+    log "Processing ${subject}"
+    validate_subject "${subject}"
+    mkdir -p "${subject_output_dir}/logs"
+
+    cp "${MASTER_LUT}" "${subject_output_dir}/LUT_${ANNOT_NAME}.txt"
+    sed -i.bak '/_H_ROI/d' "${subject_output_dir}/LUT_${ANNOT_NAME}.txt"
+    rm -f "${subject_output_dir}/LUT_${ANNOT_NAME}.txt.bak"
+
+    map_annotations_to_subject "${subject}" "${subject_output_dir}"
+    create_volume "${subject}" "${subject_output_dir}"
+
+    if [[ "${CREATE_MASKS}" == "YES" ]]; then
+        create_cortical_masks "${subject_output_dir}"
+    fi
+
+    if [[ "${CREATE_ASEG}" == "YES" ]]; then
+        create_aseg_masks "${subject_output_dir}"
+    fi
+
+    if [[ "${GET_STATS}" == "YES" ]]; then
+        create_stats_tables "${subject}" "${subject_output_dir}"
+    fi
+
+    info "${subject} started at ${started_at}; finished at $(date)."
+}
+
+wait_for_subject_batch() {
+    local failed=0
+    local pid
+
+    for pid in "$@"; do
+        if ! wait "${pid}"; then
+            failed=1
+        fi
+    done
+
+    return "${failed}"
+}
+
+process_subjects() {
+    local subject
     local subjects_to_process="${TEMP_DIR}/subjects_to_process.txt"
+    local -a pids=()
 
-    sed -n "${FIRST_ROW},${LAST_ROW}p" "${SUBJECT_LIST_FILE}" >"${subjects_to_process}"
-
-    while IFS= read -r subject || [[ -n "${subject}" ]]; do
+    : >"${subjects_to_process}"
+    sed -n "${FIRST_ROW},${LAST_ROW}p" "${SUBJECT_LIST_FILE}" | while IFS= read -r subject || [[ -n "${subject}" ]]; do
         subject="${subject%$'\r'}"
         [[ -z "${subject}" ]] && continue
         [[ "${subject}" =~ ^[[:space:]]*# ]] && continue
+        printf '%s\n' "${subject}" >>"${subjects_to_process}"
+    done
 
-        started_at="$(date)"
-        subject_output_dir="${OUTPUT_DIR}/${subject}"
+    [[ -s "${subjects_to_process}" ]] || fail "No subjects were selected from ${SUBJECT_LIST_FILE}."
 
-        log "Processing ${subject}"
-        validate_subject "${subject}"
-        mkdir -p "${subject_output_dir}/logs"
+    if ((JOBS == 1)); then
+        while IFS= read -r subject || [[ -n "${subject}" ]]; do
+            process_one_subject "${subject}"
+        done <"${subjects_to_process}"
+        return
+    fi
 
-        cp "${MASTER_LUT}" "${subject_output_dir}/LUT_${ANNOT_NAME}.txt"
-        sed -i.bak '/_H_ROI/d' "${subject_output_dir}/LUT_${ANNOT_NAME}.txt"
-        rm -f "${subject_output_dir}/LUT_${ANNOT_NAME}.txt.bak"
+    log "Processing up to ${JOBS} subjects at once"
 
-        map_annotations_to_subject "${subject}" "${subject_output_dir}"
-        create_volume "${subject}" "${subject_output_dir}"
+    while IFS= read -r subject || [[ -n "${subject}" ]]; do
+        process_one_subject "${subject}" &
+        pids+=("$!")
 
-        if [[ "${CREATE_MASKS}" == "YES" ]]; then
-            create_cortical_masks "${subject_output_dir}"
+        if ((${#pids[@]} >= JOBS)); then
+            wait_for_subject_batch "${pids[@]}" || fail "One or more subjects failed."
+            pids=()
         fi
-
-        if [[ "${CREATE_ASEG}" == "YES" ]]; then
-            create_aseg_masks "${subject_output_dir}"
-        fi
-
-        if [[ "${GET_STATS}" == "YES" ]]; then
-            create_stats_tables "${subject}" "${subject_output_dir}"
-        fi
-
-        info "${subject} started at ${started_at}; finished at $(date)."
     done <"${subjects_to_process}"
+
+    if ((${#pids[@]} > 0)); then
+        wait_for_subject_batch "${pids[@]}" || fail "One or more subjects failed."
+    fi
 }
 
 FIRST_ROW=1
@@ -600,9 +798,15 @@ LAST_ROW=""
 CREATE_MASKS=NO
 CREATE_ASEG=NO
 GET_STATS=YES
+REMAP_ANNOTATIONS=NO
+JOBS=1
 MAPPING_MODE="${HCPMMP1_MAPPING_MODE:-labels}"
+POSTPROCESS_BACKEND="${HCPMMP1_POSTPROCESS:-auto}"
+PYTHON_BIN=""
+CORTICAL_MASK_SPEC=""
+ASEG_MASK_SPEC=""
 
-while getopts ":L:f:l:a:d:m:t:s:h" option; do
+while getopts ":L:f:l:a:d:m:t:s:r:j:h" option; do
     case "${option}" in
         L) SUBJECT_LIST_ARG="${OPTARG}" ;;
         f) FIRST_ROW="${OPTARG}" ;;
@@ -612,6 +816,8 @@ while getopts ":L:f:l:a:d:m:t:s:h" option; do
         m) CREATE_MASKS="${OPTARG}" ;;
         t) GET_STATS="${OPTARG}" ;;
         s) CREATE_ASEG="${OPTARG}" ;;
+        r) REMAP_ANNOTATIONS="${OPTARG}" ;;
+        j) JOBS="${OPTARG}" ;;
         h)
             usage
             exit 0
@@ -640,6 +846,8 @@ fi
 CREATE_MASKS="$(normalize_yes_no "-m" "${CREATE_MASKS}")"
 CREATE_ASEG="$(normalize_yes_no "-s" "${CREATE_ASEG}")"
 GET_STATS="$(normalize_yes_no "-t" "${GET_STATS}")"
+REMAP_ANNOTATIONS="$(normalize_yes_no "-r" "${REMAP_ANNOTATIONS}")"
+is_positive_integer "${JOBS}" || fail "-j must be a positive integer."
 
 case "${MAPPING_MODE}" in
     labels | direct)
@@ -669,7 +877,7 @@ COLOR_LUT=""
 
 require_command mri_annotation2label
 require_command mri_aparc2aseg
-require_command fslmaths
+configure_postprocess_backend
 
 if [[ "${GET_STATS}" == "YES" ]]; then
     require_command mris_anatomical_stats
@@ -695,9 +903,19 @@ fi
 log "SUBJECTS_DIR: ${SUBJECTS_DIR}"
 log "Output directory: ${OUTPUT_DIR}"
 log "Mapping mode: ${MAPPING_MODE}"
+log "Post-processing backend: ${POSTPROCESS_BACKEND}"
 
 ensure_annotation_files
 build_region_metadata
+
+if [[ "${POSTPROCESS_BACKEND}" == "python" && "${CREATE_MASKS}" == "YES" ]]; then
+    prepare_cortical_mask_spec
+fi
+
+if [[ "${POSTPROCESS_BACKEND}" == "python" && "${CREATE_ASEG}" == "YES" ]]; then
+    prepare_aseg_mask_spec
+fi
+
 process_subjects
 
 log "Processing complete"
